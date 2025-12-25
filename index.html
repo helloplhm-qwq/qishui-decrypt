@@ -1,0 +1,650 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="referrer" content="no-referrer">
+  <title>CENC MP4 解密工具</title>
+  <style>
+    body { font-family: "Segoe UI", Roboto, Helvetica, Arial, sans-serif; max-width: 900px; margin: 2rem auto; padding: 0 1rem; line-height: 1.6; background-color: #f4f4f4; }
+    .container { background: white; padding: 25px; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
+    h1 { color: #333; border-bottom: 2px solid #007bff; padding-bottom: 10px; margin-top: 0; }
+    
+    .tabs { display: flex; border-bottom: 1px solid #ddd; margin-bottom: 20px; }
+    .tab { padding: 10px 20px; cursor: pointer; border: 1px solid transparent; border-bottom: none; border-radius: 4px 4px 0 0; background: #e9ecef; margin-right: 5px; }
+    .tab.active { background: white; border-color: #ddd; border-bottom-color: white; font-weight: bold; color: #007bff; }
+    
+    .section { display: none; }
+    .section.active { display: block; }
+
+    .form-group { margin-bottom: 20px; }
+    label { display: block; margin-bottom: 8px; font-weight: 600; color: #555; }
+    input[type="text"], input[type="file"] { width: 100%; padding: 10px; border: 1px solid #ccc; border-radius: 4px; box-sizing: border-box; font-family: monospace; }
+    input[type="text"]:focus { border-color: #007bff; outline: none; }
+    
+    .key-display { font-family: monospace; font-size: 0.9em; color: #666; background: #eee; padding: 5px; border-radius: 3px; margin-top: 5px; word-break: break-all; min-height: 1.5em; }
+
+    button { background: #007bff; color: white; border: none; padding: 12px 25px; cursor: pointer; border-radius: 4px; font-size: 16px; transition: background 0.2s; display: block; width: 100%; }
+    button:hover { background: #0056b3; }
+    button:disabled { background: #ccc; cursor: not-allowed; }
+
+    #log { margin-top: 25px; white-space: pre-wrap; background: #2d2d2d; color: #00ff00; padding: 15px; border-radius: 4px; height: 350px; overflow-y: auto; font-family: Consolas, Monaco, monospace; font-size: 14px; }
+    
+    .progress-wrapper { margin-top: 20px; display: none; }
+    .progress-info { display: flex; justify-content: space-between; font-size: 0.9em; margin-bottom: 5px; }
+    .progress { width: 100%; background: #e9ecef; height: 25px; border-radius: 4px; overflow: hidden; }
+    .progress-bar { height: 100%; background: #28a745; width: 0%; transition: width 0.1s linear; display: flex; align-items: center; justify-content: center; color: white; font-size: 12px; }
+  </style>
+</head>
+<body>
+
+  <div class="container">
+    <h1>CENC MP4 解密工具</h1>
+    
+    <!-- 密钥输入部分 -->
+    <div class="form-group">
+      <label for="spadeInput">输入密钥(hex/spade_a):</label>
+      <input type="text" id="spadeInput" placeholder="在此粘贴密钥..." oninput="updateKeyFromSpade()">
+      <div class="key-display" id="derivedKeyDisplay">Hex Key: 等待输入...</div>
+    </div>
+
+    <div class="form-group" style="display:none;">
+      <label for="keyInput">Hex Key (直接输入):</label>
+      <input type="text" id="keyInput" placeholder="如果不使用 spade_a，可直接粘贴 Hex Key">
+    </div>
+
+    <!-- 来源切换 -->
+    <div class="tabs">
+      <div class="tab active" onclick="switchTab('url')">在线 URL 下载</div>
+      <div class="tab" onclick="switchTab('file')">本地文件上传</div>
+    </div>
+
+    <div id="section-url" class="section active">
+      <div class="form-group">
+        <label for="urlInput">视频地址 (URL):</label>
+        <input type="text" id="urlInput" placeholder="https://example.com/video.mp4">
+        <small style="color: #666; display: block; margin-top: 5px;">
+          * 提示: 已启用 <code>no-referrer</code>。只要对方服务器允许跨域(CORS)，即可下载。
+        </small>
+      </div>
+    </div>
+
+    <div id="section-file" class="section">
+      <div class="form-group">
+        <label for="fileInput">选择本地文件:</label>
+        <input type="file" id="fileInput">
+      </div>
+    </div>
+
+    <button id="startBtn" onclick="startProcess()">开始解密并下载</button>
+
+    <div class="progress-wrapper" id="progressWrapper">
+      <div class="progress-info">
+        <span id="progressStatus">准备中...</span>
+        <span id="progressPercent">0%</span>
+      </div>
+      <div class="progress">
+        <div class="progress-bar" id="progressBar"></div>
+      </div>
+    </div>
+
+    <div id="log">等待操作...</div>
+  </div>
+
+  <script>
+  function decodeBase36(c) {
+      if (c >= 48 && c <= 57) return c - 48; // '0'-'9'
+      if (c >= 97 && c <= 122) return c - 97 + 10; // 'a'-'z'
+      return 0xFF;
+    }
+
+    function bitCount(n) {
+      n = n - ((n >> 1) & 0x55555555);
+      n = (n & 0x33333333) + ((n >> 2) & 0x33333333);
+      return ((n + (n >> 4) & 0xF0F0F0F) * 0x1010101) >> 24;
+    }
+
+    function decryptSpadeInner(spadeKey) {
+      const result = new Uint8Array(spadeKey); 
+      const buff = new Uint8Array(2 + spadeKey.length);
+      buff.set([0xFA, 0x55], 0);
+      buff.set(spadeKey, 2);
+
+      for (let i = 0; i < result.length; i++) {
+        let v = (spadeKey[i] ^ buff[i]) - bitCount(i) - 21;
+        while (v < 0) { v += 0xFF; }
+        result[i] = v;
+      }
+      return result;
+    }
+
+    function decryptSpade(spadeKeyBytes) {
+      const spadeKeyLen = spadeKeyBytes.length;
+      if (spadeKeyLen < 3) return "";
+      const paddingLen = (spadeKeyBytes[0] ^ spadeKeyBytes[1] ^ spadeKeyBytes[2]) - 48; 
+      if (spadeKeyLen < paddingLen + 2) return "";
+      const innerInput = spadeKeyBytes.slice(1, spadeKeyLen - paddingLen);
+      const tmpBuff = decryptSpadeInner(innerInput);
+      if (tmpBuff.length === 0) return "";
+      const skipBytes = decodeBase36(tmpBuff[0]);
+      const decodedMessageLen = spadeKeyLen - paddingLen - 2;
+      const endIndex = 1 + decodedMessageLen - skipBytes;
+      if (endIndex > tmpBuff.length) return "";
+      const finalBytes = tmpBuff.slice(1, endIndex);
+      return new TextDecoder("utf-8").decode(finalBytes);
+    }
+
+    function decryptSpadeA(spadeAStr) {
+      try {
+        const binaryString = atob(spadeAStr);
+        const bytes = new Uint8Array(binaryString.length);
+        for (let i = 0; i < binaryString.length; i++) {
+          bytes[i] = binaryString.charCodeAt(i);
+        }
+        return decryptSpade(bytes);
+      } catch (e) {
+        console.error("Spade parsing error", e);
+        return "";
+      }
+    }
+
+    let currentMode = 'url';
+    let derivedKey = '';
+
+    function switchTab(mode) {
+      currentMode = mode;
+      document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+      document.querySelector(`.tab[onclick="switchTab('${mode}')"]`).classList.add('active');
+      
+      document.querySelectorAll('.section').forEach(s => s.classList.remove('active'));
+      document.getElementById(`section-${mode}`).classList.add('active');
+    }
+
+    function updateKeyFromSpade() {
+      const val = document.getElementById('spadeInput').value.trim();
+      const display = document.getElementById('derivedKeyDisplay');
+      if (!val) {
+        display.textContent = "Hex Key: 等待输入...";
+        derivedKey = '';
+        return;
+      }
+      let key = decryptSpadeA(val);
+      if (val.match(/^[a-f0-9]{32}$/i)) { // 简单的 Hex 校验
+        key = val;
+      }
+      if (key) {
+        derivedKey = key;
+        display.textContent = "Hex Key: " + key;
+        display.style.color = "#008800";
+      } else {
+        derivedKey = '';
+        display.textContent = "Hex Key: 解析失败 (无效的 spade_a)";
+        display.style.color = "#cc0000";
+      }
+    }
+
+    function log(msg) {
+      const el = document.getElementById('log');
+      const time = new Date().toLocaleTimeString();
+      el.textContent += `[${time}] ${msg}\n`;
+      el.scrollTop = el.scrollHeight;
+      console.log(msg);
+    }
+
+    function updateProgress(percent, msg) {
+      const bar = document.getElementById('progressBar');
+      const text = document.getElementById('progressPercent');
+      const status = document.getElementById('progressStatus');
+      const wrapper = document.getElementById('progressWrapper');
+      
+      wrapper.style.display = 'block';
+      bar.style.width = percent + '%';
+      text.textContent = percent + '%';
+      if (msg) status.textContent = msg;
+    }
+
+    function hexToBytes(hex) {
+      if (!hex) return new Uint8Array(0);
+      if (hex.length % 2 !== 0) throw new Error("Key 长度必须为偶数");
+      const bytes = new Uint8Array(hex.length / 2);
+      for (let i = 0; i < hex.length; i += 2) {
+        bytes[i / 2] = parseInt(hex.substr(i, 2), 16);
+      }
+      return bytes;
+    }
+
+    function concatUint8Arrays(arrays) {
+      let totalLength = 0;
+      for (const arr of arrays) totalLength += arr.length;
+      const result = new Uint8Array(totalLength);
+      let offset = 0;
+      for (const arr of arrays) {
+        result.set(arr, offset);
+        offset += arr.length;
+      }
+      return result;
+    }
+
+    function readUint32BE(data, offset) {
+      const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
+      return view.getUint32(offset, false);
+    }
+
+    function writeUint32BE(value) {
+      const arr = new Uint8Array(4);
+      new DataView(arr.buffer).setUint32(0, value, false);
+      return arr;
+    }
+
+    class MP4Box {
+      constructor(data, offset) {
+        this.offset = offset;
+        this.size = readUint32BE(data, offset);
+        this.type = new TextDecoder('ascii').decode(data.subarray(offset + 4, offset + 8));
+        this.data = data.subarray(offset + 8, offset + this.size);
+      }
+      static findBox(data, boxType, offset = 0, end = null) {
+        if (end === null) end = data.length;
+        let pos = offset;
+        while (pos < end) {
+          if (pos + 8 > end) break;
+          const size = readUint32BE(data, pos);
+          if (size === 0 || size > end - pos || size < 8) break;
+          const currentType = new TextDecoder('ascii').decode(data.subarray(pos + 4, pos + 8));
+          if (currentType === boxType) return new MP4Box(data, pos);
+          pos += size;
+        }
+        return null;
+      }
+    }
+
+    // 全局解析变量
+    let g_sampleSizes = [];
+    let g_stscEntries = [];
+    let g_chunkCount = 0;
+
+    function parseStsz(data) {
+      const size = readUint32BE(data, 4);
+      const count = readUint32BE(data, 8);
+      if (size !== 0) return new Array(count).fill(size);
+      const sizes = [];
+      for (let i = 0; i < count; i++) sizes.push(readUint32BE(data, 12 + i * 4));
+      return sizes;
+    }
+
+    function parseStsc(data) {
+      const count = readUint32BE(data, 4);
+      const entries = [];
+      for (let i = 0; i < count; i++) {
+        const b = 8 + i * 12;
+        entries.push({
+          firstChunk: readUint32BE(data, b),
+          samplesPerChunk: readUint32BE(data, b + 4),
+          id: readUint32BE(data, b + 8)
+        });
+      }
+      return entries;
+    }
+
+    function parseSenc(data) {
+      const count = readUint32BE(data, 4);
+      const ivs = [];
+      let pos = 8;
+      for (let i = 0; i < count; i++) {
+        const iv = new Uint8Array(16);
+        iv.set(data.subarray(pos, pos + 8));
+        ivs.push(iv);
+        pos += 8;
+      }
+      return ivs;
+    }
+
+    function calculateChunkOffsets(sampleSizes, stsc, chunkCount, baseOffset) {
+      const offsets = [];
+      let current = baseOffset;
+      let sIdx = 0;
+      for (let c = 1; c <= chunkCount; c++) {
+        offsets.push(current);
+        let count = 0;
+        for (let i = 0; i < stsc.length; i++) {
+          if (c >= stsc[i].firstChunk && (!stsc[i+1] || c < stsc[i+1].firstChunk)) {
+            count = stsc[i].samplesPerChunk;
+            break;
+          }
+        }
+        for (let k = 0; k < count; k++) {
+          if (sIdx < sampleSizes.length) current += sampleSizes[sIdx++];
+        }
+      }
+      return offsets;
+    }
+
+    function updateStco(data, offsets) {
+      const count = readUint32BE(data, 4);
+      const header = data.subarray(0, 8);
+      const body = new Uint8Array(offsets.length * 4);
+      const v = new DataView(body.buffer);
+      offsets.forEach((o, i) => v.setUint32(i*4, o, false));
+      return concatUint8Arrays([header, body]);
+    }
+
+    function processBoxTree(data, offset, size, newMdatOffset) {
+      const parts = [];
+      let pos = offset + 8;
+      const end = offset + size;
+      const enc = new TextEncoder();
+
+      while (pos < end) {
+        if (pos + 8 > end) { parts.push(data.subarray(pos, end)); break; }
+        const boxSize = readUint32BE(data, pos);
+        if (boxSize < 8 || boxSize > end - pos) { parts.push(data.subarray(pos, end)); break; }
+        const type = new TextDecoder('ascii').decode(data.subarray(pos + 4, pos + 8));
+
+        // 过滤掉加密相关的 box
+        if (['senc','saio','saiz','sinf','schi','tenc','schm','frma'].includes(type)) {
+          pos += boxSize; continue;
+        }
+        
+        // enca (Encrypted Audio) -> mp4a (Plain Audio)
+        // 注意：这里我们盲目的把 enca 改成 mp4a。
+        // 如果原始流是 FLAC，这在 rebuild mp4 时可能不够完美，但我们有新的提取逻辑处理 FLAC 提取。
+        // 若用户选择下载 .mp4 (非FLAC)，这个逻辑能保证基本的播放兼容性。
+        if (type === 'enca') {
+          const inner = processBoxTree(data, pos, boxSize, newMdatOffset);
+          parts.push(writeUint32BE(inner.length + 8));
+          parts.push(enc.encode('mp4a')); // 回退到通用的 mp4a 容器标识
+          parts.push(inner);
+          pos += boxSize; continue;
+        }
+
+        if (type === 'stco') {
+          const newOffsets = calculateChunkOffsets(g_sampleSizes, g_stscEntries, g_chunkCount, newMdatOffset);
+          const newBody = updateStco(data.subarray(pos+8, pos+boxSize), newOffsets);
+          parts.push(writeUint32BE(newBody.length + 8));
+          parts.push(enc.encode('stco'));
+          parts.push(newBody);
+          pos += boxSize; continue;
+        }
+
+        // 递归处理容器 box
+        if (['moov','trak','mdia','minf','stbl','stsd'].includes(type)) {
+          const inner = processBoxTree(data, pos, boxSize, newMdatOffset);
+          parts.push(writeUint32BE(inner.length + 8));
+          parts.push(enc.encode(type));
+          parts.push(inner);
+          pos += boxSize; continue;
+        }
+
+        parts.push(data.subarray(pos, pos + boxSize));
+        pos += boxSize;
+      }
+      return concatUint8Arrays(parts);
+    }
+
+    async function fetchFile(url) {
+      log(`[*] 开始下载: ${url}`);
+      updateProgress(0, "正在连接...");
+      
+      try {
+        const response = await fetch(url);
+        if (!response.ok) throw new Error(`HTTP Error ${response.status}`);
+        
+        const reader = response.body.getReader();
+        const contentLength = +response.headers.get('Content-Length');
+        let receivedLength = 0;
+        let chunks = [];
+
+        while(true) {
+          const {done, value} = await reader.read();
+          if (done) break;
+          chunks.push(value);
+          receivedLength += value.length;
+          
+          if (contentLength) {
+            const percent = Math.floor((receivedLength / contentLength) * 100);
+            updateProgress(percent, `下载中: ${(receivedLength/1024/1024).toFixed(2)} MB`);
+          } else {
+            updateProgress(50, `下载中 (未知大小): ${(receivedLength/1024/1024).toFixed(2)} MB`);
+          }
+        }
+        
+        updateProgress(100, "下载完成，合并数据...");
+        const allData = new Uint8Array(receivedLength);
+        let position = 0;
+        for(let chunk of chunks) {
+          allData.set(chunk, position);
+          position += chunk.length;
+        }
+        
+        log(`[*] 下载完成，大小: ${receivedLength} bytes`);
+        return { data: allData, filename: url.split('/').pop().split('?')[0] || 'video.mp4' };
+      } catch (e) {
+        throw new Error(`下载失败: ${e.message} (可能是跨域CORS问题)`);
+      }
+    }
+
+    // === 新增：从 stsd 中查找 FLAC 元数据 ===
+    function scanForFlacMetadata(stsdData) {
+      // stsd 结构: 4B size, 4B type, 1B version, 3B flags, 4B count, Entries...
+      // 我们跳过 stsd 头部 (16 bytes)，直接暴力搜索内部的 dfLa box
+      // dfLa box 包含 FLAC STREAMINFO 等元数据块
+      
+      // 简单的搜索 'dfLa' 字符串
+      const searchStr = [0x64, 0x66, 0x4C, 0x61]; // "dfLa"
+      
+      for(let i=0; i < stsdData.length - 4; i++) {
+        if (stsdData[i] === searchStr[0] && stsdData[i+1] === searchStr[1] &&
+            stsdData[i+2] === searchStr[2] && stsdData[i+3] === searchStr[3]) {
+          
+          // 找到了 dfLa 标签。Box 大小在它前面4个字节
+          const boxSize = readUint32BE(stsdData, i - 4);
+          const boxData = stsdData.subarray(i + 4, i - 4 + boxSize); // 内容部分 (不含 size 和 type)
+          
+          // dfLa box 内部是 FLACDecSpecificInfo。
+          // 格式通常为: 1 byte (version 0) + 3 bytes (flags) + FLAC Metadata Blocks
+          // 但实际观察中，dfLa 往往直接包含 Metadata Block，或者带有一个简单的头。
+          // 标准 FLAC 文件头: "fLaC" (4 bytes) + Metadata Blocks...
+          // dfLa 通常只包含 Metadata Blocks。
+          // 第一个 Block 必须是 STREAMINFO (type 0)。
+          // Block Header: 1 bit (Last?), 7 bits (Type), 24 bits (Length)
+          
+          // 尝试探测 STREAMINFO。Type 0。
+          // 很多 MP4 封装中，dfLa 的数据直接以 0x00 或 0x80 (如果只有一个block) 开头。
+          
+          return boxData; 
+        }
+      }
+      return null;
+    }
+
+    async function startProcess() {
+      const btn = document.getElementById('startBtn');
+      const logEl = document.getElementById('log');
+      logEl.textContent = "";
+
+      let keyHex = document.getElementById('keyInput').value.trim();
+      if (derivedKey) keyHex = derivedKey;
+
+      if (!keyHex) {
+        alert("请提供 spade_a 或 Hex Key");
+        return;
+      }
+
+      btn.disabled = true;
+
+      try {
+        let fileData = null;
+        let fileName = "video.mp4";
+
+        if (currentMode === 'file') {
+          const fileInput = document.getElementById('fileInput');
+          if (!fileInput.files[0]) throw new Error("请选择本地文件");
+          log(`[*] 读取本地文件...`);
+          fileData = new Uint8Array(await fileInput.files[0].arrayBuffer());
+          fileName = fileInput.files[0].name;
+        } else {
+          const url = document.getElementById('urlInput').value.trim();
+          if (!url) throw new Error("请输入 URL");
+          const result = await fetchFile(url);
+          fileData = result.data;
+          fileName = result.filename;
+        }
+
+        log(`[*] 导入密钥: ${keyHex.substring(0,6)}...`);
+        const keyBytes = hexToBytes(keyHex);
+        const cryptoKey = await window.crypto.subtle.importKey(
+          "raw", keyBytes, "AES-CTR", false, ["decrypt"]
+        );
+
+        log("[*] 解析 MP4 结构...");
+        const ftyp = MP4Box.findBox(fileData, 'ftyp');
+        const moov = MP4Box.findBox(fileData, 'moov');
+        if (!moov) throw new Error("未找到 moov atom");
+
+        const trak = MP4Box.findBox(fileData, 'trak', moov.offset+8, moov.offset+moov.size);
+        const mdia = MP4Box.findBox(fileData, 'mdia', trak.offset+8, trak.offset+trak.size);
+        const minf = MP4Box.findBox(fileData, 'minf', mdia.offset+8, mdia.offset+mdia.size);
+        const stbl = MP4Box.findBox(fileData, 'stbl', minf.offset+8, minf.offset+minf.size);
+        
+        // 关键：获取 stsd 以检查是否为 FLAC
+        const stsd = MP4Box.findBox(fileData, 'stsd', stbl.offset+8, stbl.offset+stbl.size);
+        const flacMetadata = scanForFlacMetadata(stsd.data); // 尝试寻找 FLAC 元数据
+        const isFlac = !!flacMetadata;
+
+        if (isFlac) {
+          log("[!] 检测到 FLAC 编码！将提取为 .flac 文件");
+        } else {
+          log("[*] 未检测到 FLAC (可能是 AAC/AVC)，将重建为 MP4/M4A");
+        }
+
+        const stsz = MP4Box.findBox(fileData, 'stsz', stbl.offset+8, stbl.offset+stbl.size);
+        const stsc = MP4Box.findBox(fileData, 'stsc', stbl.offset+8, stbl.offset+stbl.size);
+        const stco = MP4Box.findBox(fileData, 'stco', stbl.offset+8, stbl.offset+stbl.size);
+
+        g_sampleSizes = parseStsz(stsz.data);
+        g_stscEntries = parseStsc(stsc.data);
+        g_chunkCount = readUint32BE(stco.data, 4);
+
+        let senc = MP4Box.findBox(fileData, 'senc', stbl.offset+8, stbl.offset+stbl.size);
+        if (!senc) senc = MP4Box.findBox(fileData, 'senc', moov.offset+8, moov.offset+moov.size);
+        if (!senc) throw new Error("未找到加密信息 (senc)");
+        
+        const ivs = parseSenc(senc.data);
+        const mdat = MP4Box.findBox(fileData, 'mdat');
+
+        log(`[*] 样本数: ${g_sampleSizes.length}, IV数: ${ivs.length}`);
+
+        log("[*] 开始 AES-CTR 解密...");
+        updateProgress(0, "正在解密...");
+        const decryptedSamples = [];
+        let sampleOffset = mdat.offset + 8;
+        
+        for (let i = 0; i < g_sampleSizes.length; i++) {
+          const size = g_sampleSizes[i];
+          const iv = ivs[i];
+          
+          const encrypted = fileData.subarray(sampleOffset, sampleOffset + size);
+          const decrypted = await window.crypto.subtle.decrypt(
+            { name: "AES-CTR", counter: iv, length: 64 },
+            cryptoKey,
+            encrypted
+          );
+          decryptedSamples.push(new Uint8Array(decrypted));
+          sampleOffset += size;
+
+          if (i % 100 === 0) {
+            const pct = Math.floor((i / g_sampleSizes.length) * 100);
+            updateProgress(pct, `解密中: ${i}/${g_sampleSizes.length}`);
+            if (i % 2000 === 0) await new Promise(r => setTimeout(r, 0));
+          }
+        }
+
+        updateProgress(100, "生成文件...");
+        
+        let finalBlob = null;
+        let finalExt = "";
+
+        // === 分支处理：FLAC vs MP4 ===
+        if (isFlac) {
+           // 1. 构建 FLAC 头 "fLaC"
+           const flacSig = new Uint8Array([0x66, 0x4C, 0x61, 0x43]); 
+           
+           // 2. 准备 Metadata
+           // dfLa box 的内容通常包含一个版本字节(0x00)和三个标志字节，后面紧跟 Metadata Block
+           // 我们需要把 Version/Flags 去掉，只留 Metadata Block。
+           // Metadata Block Header 第一个字节如果是 0x00 或 0x80 (STREAMINFO)
+           // 简单的 heuristic: 查找 Block Type 0 (STREAMINFO)
+           
+           let metaStart = 0;
+           // 查找 metadata block header. STREAMINFO type is 0 (first 7 bits).
+           // dfLa 封装通常前4字节是 Version(1)+Flags(3).
+           if (flacMetadata.length > 4) {
+             metaStart = 4; 
+           }
+           
+           const metaBody = flacMetadata.subarray(metaStart);
+           
+           // 3. 拼接所有数据
+           const parts = [flacSig, metaBody, ...decryptedSamples];
+           finalBlob = new Blob(parts, { type: 'audio/flac' });
+           finalExt = ".flac";
+           
+           log(`[*] 已封装为 FLAC (Raw Extraction)`);
+
+        } else {
+           // === 原始逻辑：重建 MP4 ===
+           log("[*] 重建 MP4 容器...");
+           
+           const ftypSize = ftyp ? ftyp.size : 0;
+           const dummyMoov = processBoxTree(fileData, moov.offset, moov.size, 0);
+           const newMdatOffset = ftypSize + dummyMoov.length + 8 + 8; 
+           
+           const cleanMoovData = processBoxTree(fileData, moov.offset, moov.size, newMdatOffset);
+           const cleanMoov = new Uint8Array(cleanMoovData.length + 8);
+           new DataView(cleanMoov.buffer).setUint32(0, cleanMoov.length, false);
+           cleanMoov.set(new TextEncoder().encode('moov'), 4);
+           cleanMoov.set(cleanMoovData, 8);
+
+           const mdatData = concatUint8Arrays(decryptedSamples);
+           const newMdat = new Uint8Array(mdatData.length + 8);
+           new DataView(newMdat.buffer).setUint32(0, newMdat.length, false);
+           newMdat.set(new TextEncoder().encode('mdat'), 4);
+           newMdat.set(mdatData, 8);
+
+           const finalParts = [];
+           if (ftyp) finalParts.push(fileData.subarray(ftyp.offset, ftyp.offset+ftyp.size));
+           finalParts.push(cleanMoov);
+           finalParts.push(newMdat);
+
+           finalBlob = new Blob(finalParts, { type: 'video/mp4' });
+           // 尝试改名为 .m4a 如果没有视频轨 (虽然这里没检测，但如果是纯音频改名无妨)
+           finalExt = fileName.endsWith('.mp4') ? '.mp4' : '.m4a';
+        }
+
+        log(`[*] 完成! 输出大小: ${(finalBlob.size/1024/1024).toFixed(2)} MB`);
+        updateProgress(100, "完成!");
+
+        const dUrl = URL.createObjectURL(finalBlob);
+        const a = document.createElement('a');
+        a.href = dUrl;
+        // 修改文件名逻辑
+        let saveName = fileName;
+        // 去除原有扩展名
+        saveName = saveName.replace(/\.(mp4|m4a|encv|enca)$/i, "");
+        saveName += finalExt;
+
+        a.download = "decrypted_" + saveName;
+        a.click();
+        URL.revokeObjectURL(dUrl);
+
+      } catch (e) {
+        console.error(e);
+        log(`[!] 错误: ${e.message}`);
+        alert(`出错: ${e.message}`);
+      } finally {
+        btn.disabled = false;
+      }
+    }
+  </script>
+</body>
+</html>
